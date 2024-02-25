@@ -1,0 +1,171 @@
+# Dependencies
+Utility= (require './utility').Utility
+
+Promise= require 'bluebird'
+
+Jasmine= require 'jasmine'
+Reporter= require 'jasmine-terminal-reporter'
+wanderer= require 'wanderer'
+chalk= require 'chalk'
+
+fs= require 'fs'
+path= require 'path'
+{exec,spawn}= require 'child_process'
+
+# Public
+class Collection extends Utility
+  # Pass specs to Jasmine via CLI.jasminetea
+  doRun: (specs,{timeout,silent,stacktrace}={})->
+    jasmine= new Jasmine
+    jasmine.jasmine.DEFAULT_TIMEOUT_INTERVAL= timeout
+
+    unless @test
+      jasmine.addReporter new Reporter
+        showColors: true
+        isVerbose: not silent
+        includeStackTrace: stacktrace
+
+    @doRunJasmine specs,jasmine
+    .then (failure)=>
+      cover= ('-c' in process.argv) or ('--cover' in process.argv)
+      if cover
+        if jasmine.specFiles.length
+          @log 'Calculating...'
+        else
+          @log 'Skip --cover.  Because not exists in',@whereabouts(specs)
+
+      failure
+
+  doRunJasmine: (specs,jasmine)->
+    failure= no
+    passed= 0
+
+    new Promise (resolve)=>
+      wanderer.seek specs
+        .on 'data',(file)=>
+          filename= path.resolve process.cwd(),file
+
+          @deleteRequireCache require.resolve filename
+          
+          jasmine.addSpecFile filename
+        .once 'end',=>
+          count= jasmine.specFiles.length
+          if count is 0
+            @log chalk.red 'Spec not exists in',@whereabouts(specs)
+
+            return resolve yes
+
+          @log "Found #{count} files in",@whereabouts(specs),'...\n'
+          try
+            jasmine.execute()
+
+          catch error
+            console.error error?.stack or error?.message
+
+            resolve yes
+
+      jasmine.addReporter
+        specDone: (result)->
+          failure= yes if result.status is 'failed'
+          passed++ if result.status is 'passed'
+
+        jasmineDone: ->
+          failure= yes if passed is 0
+
+          resolve failure
+
+  # Pass all .coffee to coffeelint
+  doLint: (globs)->
+    options=
+      cwd: process.cwd()
+      env: process.env
+      stdio: 'inherit'
+
+    options.stdio= 'ignore' if @test
+
+    new Promise (resolve)=>
+      files= wanderer.seekSync globs
+      if files.length is 0
+        @log 'Skip --lint.   Because not exists in',@whereabouts(globs)
+        return resolve yes
+      
+      argv= [require.resolve 'coffeelint/bin/coffeelint']
+      argv.push path.relative process.cwd(),file for file in files
+      if fs.existsSync path.join process.cwd(),'.coffeelintrc'
+        argv.push '-f'
+        argv.push '.coffeelintrc'
+      else
+        home= process.env.HOME or process.env.HOMEPATH or process.env.USERPROFILE
+        homeRc= path.join home,'.coffeelintrc'
+        if fs.existsSync homeRc
+          argv.push '-f'
+          argv.push homeRc
+      @logDebug '$ '+argv.join ' '
+
+      @log '$ node ',argv.join ' ' if @debug
+      @log 'Lint in',@whereabouts(globs),'...'
+
+      spawn 'node',argv,options
+      .on 'exit',(code)->
+        resolve code isnt 0
+
+  # Re-execute jasminetea at ibrik
+  doCover: (originalArgv)->
+    options=
+      cwd: process.cwd()
+      env: process.env
+      stdio: [0,1,'ignore'] # Inherit ansi color
+
+    options.stdio= 'ignore' if @test
+
+    new Promise (resolve)=>
+      argv= []
+      argv.push 'node'
+      argv.push require.resolve 'ibrik/bin/ibrik'
+      argv.push 'cover'
+      argv.push require.resolve '../jasminetea'
+      argv.push '--'
+      argv= argv.concat originalArgv[2...]
+      @logDebug '$ '+argv.join ' '
+
+      [script,argv...]= argv
+      spawn script,argv,options
+      .on 'exit',(code)->
+        resolve code isnt 0
+
+  # Send lcov.info to coveralls.io
+  doReport: ->
+    options=
+      cwd: process.cwd()
+      env: process.env
+      maxBuffer: 1000*1024
+
+    new Promise (resolve)=>
+      existsToken= fs.existsSync path.join process.cwd(),'.coveralls.yml'
+      existsToken= process.env.COVERALLS_REPO_TOKEN? unless existsToken
+      unless existsToken
+        @log 'Skip --report. Because not exists the COVERALLS_REPO_TOKEN'
+        return resolve no
+
+      existsCoverage= fs.existsSync path.join process.cwd(),'coverage','lcov.info'
+      unless existsCoverage
+        @log 'Skip --report. Because not exists the ./coverage/lcov.info'
+        return resolve no
+
+      argv= []
+      argv.push 'cat'
+      argv.push path.join process.cwd(),'coverage','lcov.info'
+      argv.push '|'
+      argv.push require.resolve 'coveralls/bin/coveralls.js'
+      @logDebug '$ '+argv.join ' '
+
+      exec argv.join(' '),options,(error)=>
+        if error
+          @log error.message
+        else
+          @log 'Posted a coverage report.'
+
+        resolve no
+
+module.exports= new Collection
+module.exports.Collection= Collection
